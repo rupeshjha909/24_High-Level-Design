@@ -17,6 +17,7 @@
    - [4.5 Why this split? (the design rationale)](#45-why-this-split-the-design-rationale)
    - [4.6 Where the load actually goes](#46-where-the-load-actually-goes)
 5. [The Persistent Connection Model](#5-the-persistent-connection-model)
+   - [5.1 Cross-Gateway Delivery: How Server A Reaches Server B](#51-cross-gateway-delivery-how-server-a-reaches-server-b)
 6. [Message Routing (Online & Offline)](#6-message-routing-online--offline)
 7. [Message Storage](#7-message-storage)
 8. [Read Receipts & Delivery States](#8-read-receipts--delivery-states)
@@ -136,15 +137,16 @@ The key visual idea: a message comes **in** through a Gateway, goes to a **Chat 
 **② Gateway (the connection layer) — the box people under-explain.** Its *only* job is to **hold the live WebSocket connections** and shuttle bytes between the client and the chat servers. Think of it as the "switchboard." Key properties:
 - It is **horizontally scaled** — hundreds of nodes, each holding a large number of open sockets (see §4.6). A user lands on *one* gateway for the life of their connection.
 - When a client connects, the gateway **writes `user_id → this_gateway_node` into the Connection Registry** so the rest of the system can find that user.
+- It keeps a **local in-memory table** of `user_id → the actual socket object` for the connections *it personally holds* — this is what it uses to do the final push (see §5.1).
 - It runs **heartbeats** to detect dead connections (a phone that vanished without a clean close) and removes the stale registry entry when one dies.
 - It is **dumb on purpose** — it holds no business logic, so it can crash/restart and clients just reconnect to another node. Keeping logic *out* of the gateway is what lets the connection layer scale independently of the message logic.
 
-**③ Connection Registry (Redis) — "who is connected where."** A fast in-memory map: `user_id → gateway_node`. This is the linchpin that makes cross-server delivery possible. Without it, a chat server holding Alice's message would have no idea which of 200 gateways is holding Bob's socket. It's small (tens of GB even for hundreds of millions of connections — see §4.6) and lives in a Redis cluster. Entries are created on connect, refreshed by heartbeat, and removed on disconnect/timeout.
+**③ Connection Registry (Redis) — "who is connected where."** A fast in-memory map: `user_id → gateway_node`. This is the linchpin that makes cross-server delivery possible. Without it, a chat server holding Alice's message would have no idea which of 200 gateways is holding Bob's socket. It's small (tens of GB even for hundreds of millions of connections — see §4.6) and lives in a Redis cluster. Entries are created on connect, refreshed by heartbeat, and removed on disconnect/timeout. **Important:** the registry stores the *address* (which node) — it does **not** move messages. The actual A→B transport is a separate mechanism, detailed in §5.1.
 
 **④ Chat Server (the brain).** This is where the actual message logic runs. For each incoming message it:
 1. **Persists** the message to the Message DB (durability first — this is the source of truth).
 2. **Looks up the recipient** in the Connection Registry.
-3. **Routes** it: if the recipient is online, forward to their gateway to push down the socket; if offline, leave it stored and tell the Notification Service to send a push.
+3. **Routes** it: if the recipient is online, forward to their gateway to push down the socket (how this forward physically happens is §5.1); if offline, leave it stored and tell the Notification Service to send a push.
 4. **Triggers receipts/notifications** and updates message status as ACKs come back.
 Chat servers are **stateless** with respect to connections (they don't hold sockets — gateways do), so they scale horizontally and any chat server can handle any message.
 
@@ -174,8 +176,8 @@ Here is exactly what happens when **Alice sends "hi" to Bob**, step by step:
         "Where is Bob connected?"
 
 5a. Bob is ONLINE → Registry says "Bob is on Gateway-12."
-        Chat Server forwards the message to Gateway-12
-        → Gateway-12 pushes it down Bob's open WebSocket
+        Chat Server forwards the message to Gateway-12   ← HOW this A→B hop works: §5.1
+        → Gateway-12 finds Bob's socket in its LOCAL table and pushes it down
         → Bob's app receives & decrypts it.            (<200ms total)
 
 5b. Bob is OFFLINE → Registry has no entry for Bob.
@@ -233,16 +235,90 @@ Practical concerns:
 
 > Why not just keep a giant in-memory table on one server? Because no single machine can hold 200M sockets or be a single point of failure for the whole app. The gateway fleet + shared registry pattern is precisely how you spread that state across many nodes while still being able to find any user in one Redis lookup.
 
+### 5.1 Cross-Gateway Delivery: How Server A Reaches Server B
+
+This is the step most designs hand-wave, and a favorite interview drill: the registry tells you *where* the recipient is, but **it does not move the message.** Re-read the routing step — "look up Bob's gateway in Redis and forward the message there." *Forward how?* Redis just returned an address; **something still has to physically carry the bytes from the sending gateway to the receiving one.** This section fills that gap.
+
+#### Name the two connections precisely
+
+The confusion dissolves the moment you separate two *different* WebSockets:
+
+- **Alice's** WebSocket is held by **Gateway A**.
+- **Bob's** WebSocket is held by **Gateway B**.
+
+Alice's message enters through A, but it must leave through B — because that's where Bob's socket physically lives. So the real question is: *how does the message travel from process A to process B, two separate machines that may never have talked before?*
+
+#### The key realization: a socket is pinned to its process
+
+A WebSocket (and the TCP connection under it) is a **live, stateful, kernel-level object owned by the single process that accepted it.** Gateway A **cannot** write to Bob's socket — A doesn't hold it; only B does. You also cannot "move" or "teleport" the socket to A. Therefore delivery to Bob **must physically happen on Gateway B.** A's only job is to get the message *to* B; **B does the final socket write.** That single constraint is the whole reason the registry + an internal transport exist.
+
+#### Two maps, not one (this is the crux)
+
+You actually need *two* lookup structures, and conflating them is what causes the confusion:
+
+| Map | Where it lives | Scope | Answers |
+|:--|:--|:--|:--|
+| **Connection Registry (Redis)** | shared, global | all users | "*which gateway* holds Bob?" |
+| **Local socket table** | in each gateway's RAM | only that gateway's own connections | "which actual *socket object* on THIS machine is Bob's?" |
+
+Gateway A uses the **global** registry to discover "Bob is on B." Gateway B uses its **local** in-memory table to find Bob's actual socket object and write to it. The registry is the directory of *nodes*; the local table is the directory of *sockets on this node*. You need both.
+
+#### How A physically reaches B — two standard mechanisms
+
+Gateways are ordinary backend servers on the same internal network. Once A knows "Bob is on B," it delivers over an **internal server-to-server connection** — never over Bob's WebSocket. Two standard approaches, and you should know both:
+
+**Option 1 — Direct RPC (a mesh of internal connections).** The registry stores B's network *address*; A opens/reuses a persistent internal connection (gRPC / plain TCP) to B and calls it.
+
+```
+Gateway A → Redis: "Bob → Gateway B (10.0.0.12:7000)"
+Gateway A → internal gRPC/TCP call to Gateway B:  deliver(msg, Bob)
+Gateway B → finds Bob's socket in its LOCAL table → writes bytes down the socket
+```
+
+Every gateway can talk to every other gateway (an N×N mesh of persistent internal links). Simplest and lowest-latency; downsides are managing the mesh and handling B being down/moved.
+
+**Option 2 — Pub/Sub backplane (the more common answer at scale).** Route through an internal message bus (Redis Pub/Sub, NATS, or Kafka). A doesn't need B's address or a direct link — it just **publishes**, and whichever gateway holds Bob is **subscribed** and receives it.
+
+```
+Bob connects to B  → B SUBSCRIBES to a channel for Bob
+Alice's msg at A   → PUBLISH the message to Bob's channel
+Bus routes to the subscriber (B) → B finds Bob's socket LOCALLY → pushes down the socket
+```
+
+Two channel-granularity styles:
+- **Per-user channel** (`user:Bob`) — A publishes to `user:Bob` without even consulting the registry; B subscribed to it on Bob's connect. Simple, but you have millions of channels/subscriptions.
+- **Per-gateway channel** (`gateway:B`) — A first reads the registry ("Bob → B"), then publishes to `gateway:B`, which B alone subscribes to. Far fewer channels; the registry does the user→gateway resolution. **This is the usual production choice.**
+
+Trade-off: direct RPC is lower-latency but **couples** gateways (mesh + address management); the backplane **decouples** them (A never needs to know B exists) at the cost of an extra hop through the bus. Large systems usually pick the backplane for the decoupling and to absorb bursts.
+
+#### The corrected end-to-end path
+
+```
+1. Alice's msg → Gateway A → Chat Server
+2. Chat Server PERSISTS to Cassandra (durability first)
+3. Chat Server looks up Redis registry: "Bob → Gateway B"
+4. Route the message to Gateway B via EITHER
+     (a) a direct gRPC/TCP call to B's address, OR
+     (b) publishing to a channel B is subscribed to (pub/sub backplane)
+5. Gateway B receives it on its internal connection / subscription
+6. Gateway B finds Bob's WebSocket in its LOCAL in-memory table
+7. Gateway B writes the bytes down Bob's socket → Bob's app receives & decrypts
+```
+
+Step 6 resolves the puzzle: the message never "moves to A," and Bob's socket never moves to A either. The message is **carried to the node that owns Bob's socket**, and that node does the write.
+
+> 💡 **The senior one-liner:** *"Redis tells me **which** gateway holds Bob, but it doesn't move the message. The gateways form an internal cluster, so Gateway A forwards to Gateway B — either a direct gRPC call to B's address or by publishing to a pub/sub channel B subscribes to — and B looks up Bob's socket in its own local in-memory table and writes to it. A WebSocket is pinned to the process that owns it, so delivery must physically happen on that node."*
+
 ---
 
 ## 6. Message Routing (Online & Offline)
 
-The message path, step by step (the full narrated version is in §4.4):
+The message path, step by step (the full narrated version is in §4.4; the cross-gateway A→B hop is detailed in §5.1):
 
 ```
 1. User A sends a message  →  Gateway A  →  Chat Server
 2. Chat Server persists the message (Cassandra) and looks up User B in Redis
-3a. User B ONLINE  →  find B's gateway  →  push down B's WebSocket  →  B receives (<200ms)
+3a. User B ONLINE  →  find B's gateway  →  forward to that gateway (§5.1)  →  push down B's WebSocket  →  B receives (<200ms)
 3b. User B OFFLINE →  message stays stored / queued  →  send a push notification (APNs/FCM)
 4. When B reconnects → B pulls undelivered messages → marked delivered
 ```
@@ -355,6 +431,7 @@ This keeps the message path lightweight and fast, and offloads bulk bytes to sto
 
 - **Shard connection state by `user_id`** — each user's live connection and registry entry live on one gateway.
 - **Shard messages by `conversation_id`** — keeps a conversation's messages co-located for fast single-partition reads (Cassandra + consistent hashing handles this).
+- **Cross-gateway delivery via RPC or a pub/sub backplane** — the sender's gateway reaches the recipient's gateway over the internal cluster; the recipient's gateway does the final socket write (§5.1).
 - **Media off the hot path** — upload to S3, deliver via CDN, send only a URL.
 - **Push via APNs/FCM** — for background/offline notifications, hand off to the platform push services rather than holding a socket open in the background.
 - **Tiered storage** — hot in Cassandra, cold in S3.
@@ -366,7 +443,7 @@ This keeps the message path lightweight and fast, and offloads bulk bytes to sto
 ## 14. Senior Follow-Up Questions (with Answers)
 
 **Q1. How do you deliver a message to a user connected to a different server?**
-A connection registry (Redis) maps `user_id → gateway_node`. The chat server looks up the recipient's gateway and forwards the message there; that gateway pushes it down the open WebSocket. If the user is offline, the message stays in durable storage and a push notification is sent. (Full trace in §4.4.)
+A connection registry (Redis) maps `user_id → gateway_node`. The chat server looks up the recipient's gateway and forwards the message there; that gateway pushes it down the open WebSocket. If the user is offline, the message stays in durable storage and a push notification is sent. (Full trace in §4.4; the *physical* A→B forwarding mechanism is §5.1 and Q13.)
 
 **Q2. How do you guarantee message ordering?**
 Order only needs to hold **within a conversation**, not globally — a much cheaper guarantee. Use a per-conversation sequence (or server-assigned timestamp) as the sort key; clients order by it, so display is correct even if network delivery races. Cassandra's `(conversation_id, timestamp)` clustering enforces this at storage time.
@@ -401,13 +478,18 @@ They scale on different axes — connections (memory/file-descriptors per socket
 **Q12. What happens at the exact moment a recipient is reconnecting (race between push and offline)?**
 The durable store resolves it. If the chat server pushes while the socket is mid-reconnect, the push may be lost — but the message is already persisted, so on reconnect the client pulls undelivered messages and gets it anyway. Delivery is idempotent on the client (dedupe by message id), so a message that arrives both via late push and via pull is shown once.
 
+**Q13. Concretely, how does a message get from the sender's gateway to the recipient's gateway (different servers)?**
+The registry only returns an *address*, not a transport — it doesn't move the message. The gateways form an internal cluster, and the sending gateway reaches the recipient's gateway in one of two ways: (a) a **direct gRPC/TCP call** to the recipient gateway's address (a mesh), or (b) **publishing to a pub/sub channel** (Redis Pub/Sub / NATS / Kafka) that the recipient's gateway is subscribed to (the common choice at scale, because it decouples the gateways). The recipient's gateway then finds the recipient's socket in its **own local in-memory `user_id → socket` table** and writes the bytes to it. Delivery *must* happen on the node that owns the socket, because a WebSocket is pinned to the process that accepted it — you can't write to it, or move it, from another server. (Full detail in §5.1.)
+
 ---
 
 ## 15. Quick Glossary
 
 - **WebSocket** — persistent, full-duplex connection enabling server push (vs. request/response).
 - **Gateway** — server that terminates client WebSocket connections; holds live sockets, holds no business logic.
-- **Connection registry** — `user_id → gateway_node` map (Redis) used to route messages to the right node.
+- **Connection registry** — global `user_id → gateway_node` map (Redis) used to find which node holds a user; it locates, it does not transport.
+- **Local socket table** — a per-gateway in-memory `user_id → socket object` map for the connections that gateway personally holds; used to do the final push (distinct from the global registry — see §5.1).
+- **Pub/Sub backplane** — an internal message bus (Redis Pub/Sub, NATS, Kafka) that routes a message from the sender's gateway to the recipient's gateway, so the sender's node needn't know the recipient's node directly.
 - **Chat Server** — the stateless brain that persists, routes, and updates message status.
 - **Fan-out on write / read** — pushing a message to all recipients on send vs. having them pull on open.
 - **Presence** — online/last-seen status; kept approximate to avoid fan-out storms.

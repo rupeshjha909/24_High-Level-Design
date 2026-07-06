@@ -20,6 +20,7 @@
    - [5.1 Cross-Gateway Delivery: How Server A Reaches Server B](#51-cross-gateway-delivery-how-server-a-reaches-server-b)
 6. [Message Routing (Online & Offline)](#6-message-routing-online--offline)
 7. [Message Storage](#7-message-storage)
+   - [7.1 Data Contracts: Request Fields, Payloads & DB Schemas](#71-data-contracts-request-fields-inter-service-payloads--db-schemas)
 8. [Read Receipts & Delivery States](#8-read-receipts--delivery-states)
 9. [Presence / Last-Seen](#9-presence--last-seen)
 10. [Group Chat & Fan-Out](#10-group-chat--fan-out)
@@ -347,6 +348,210 @@ The design trick: **partition by `conversation_id`, sort by `message_timestamp`.
 
 ---
 
+---
+
+## 7.1 Data Contracts: Request Fields, Inter-Service Payloads & DB Schemas
+
+The sections above describe the *flow*; this one nails down the concrete **data contracts** — exactly what fields a chat request carries, what payload each service receives, and the schema of every store. (All examples verified; formats are illustrative — real systems often use protobuf, but the fields are the same.)
+
+### Part A — The client→server request (what's actually in a chat message)
+
+When a client sends a message over its WebSocket, the request carries these fields:
+
+| Field | Type | Purpose |
+|:------|:-----|:--------|
+| `type` | enum | `SEND_MESSAGE` / `ACK` / `TYPING` / `HEARTBEAT` — what kind of frame this is |
+| `client_msg_id` | string (UUID) | **client-generated id** → used for **idempotency/dedup** (a retry on flaky mobile carries the same id, so the server never stores it twice) |
+| `conversation_id` | string | which chat this belongs to (see the determinism note below) |
+| `sender_id` | string | who's sending |
+| `recipient_id` *or* `group_id` | string | the other party (1:1) or the group |
+| `content_type` | enum | `text` / `image` / `video` / `voice` |
+| `ciphertext` | base64 blob | the **E2E-encrypted** message body — the server never sees plaintext |
+| `media_ref` | object / null | for media: `{ url, key }` pointing to S3 (§12); null for text |
+| `client_ts` | epoch ms | client's send time (for display; the server assigns the authoritative order) |
+
+```json
+{
+  "type": "SEND_MESSAGE",
+  "client_msg_id": "9f2a-…-uuid",
+  "conversation_id": "c_6270f4a8d495c8ae",
+  "sender_id": "alice",
+  "recipient_id": "bob",
+  "content_type": "text",
+  "ciphertext": "BASE64_E2E_BLOB…",
+  "media_ref": null,
+  "client_ts": 1730000000123
+}
+```
+
+A text send is **~250 bytes** (verified). Two critical field notes:
+
+- **`client_msg_id` is the idempotency key.** Mobile retries and reconnect-replays can resend the same message; the server dedups on `client_msg_id` so it's stored/delivered exactly once (this is what makes Q12's reconnect race safe).
+- **`conversation_id` for a 1:1 chat must be deterministic** — computed from the *sorted* pair of user ids (e.g. `sha1(sorted(alice,bob))`), so **Alice→Bob and Bob→Alice produce the identical id** and both users' messages land in the **same partition** (verified). If you generated it randomly per-direction, the two halves of the conversation would split across partitions — a classic bug.
+
+**Other client→server frames** (same channel, different `type`):
+
+| Frame | Key fields | Purpose |
+|:------|:-----------|:--------|
+| `ACK` | `message_id`, `status` (`delivered`/`read`), `ts` | receipts (§8) — sent back when the device receives/opens a message |
+| `TYPING` | `conversation_id`, `sender_id`, `is_typing` | typing indicator (best-effort, not persisted) |
+| `HEARTBEAT` | `user_id`, `ts` | keepalive → refreshes presence + connection registry TTL (§9) |
+
+### Part B — Inter-service payloads (what each service receives)
+
+Once the Chat Server accepts a message, it produces different payloads for different services. Each is deliberately minimal.
+
+**① Gateway (inbound) → Chat Server.** The gateway just wraps the client frame with connection context — it adds nothing semantic (it's dumb by design, §4.3):
+```json
+{ "from_gateway": "gw-7", "connection_id": "conn_123", "frame": { …the client request… } }
+```
+
+**② Chat Server → recipient's Gateway (the delivery envelope).** After persisting, the Chat Server enriches the message with **server-assigned fields** and routes it to Bob's gateway (via RPC or the pub/sub backplane, §5.1):
+```json
+{
+  "type": "DELIVER",
+  "message_id": "m_01H…",          // server-assigned GLOBAL id (Snowflake, time-sortable)
+  "conversation_id": "c_6270f4a8d495c8ae",
+  "seq": 4,                         // per-conversation sequence → ordering
+  "sender_id": "alice",
+  "recipient_id": "bob",
+  "content_type": "text",
+  "ciphertext": "BASE64_E2E_BLOB…",
+  "server_ts": 1730000000200
+}
+```
+The server **adds `message_id`, `seq`, and `server_ts`** (verified) — the client's request didn't have these; the server is the authority for global id and ordering.
+
+**③ Chat Server → Notification Service (offline push).** When Bob is offline, the push payload carries **no message content** — under E2E the server *can't* read it, and you wouldn't leak it into a push anyway (verified):
+```json
+{
+  "recipient_id": "bob",
+  "title": "New message",          // generic — no content
+  "collapse_key": "c_6270f4a8…",   // collapse many msgs from one chat into one notification
+  "badge": 3
+}
+```
+This goes to APNs/FCM to wake the app; the app then reconnects and pulls the actual (encrypted) message from Cassandra.
+
+**④ Chat Server → Media Service (pre-signed URL request).** For a media message, before the send the client asks for an upload URL:
+```json
+request:  { "user_id": "alice", "content_type": "image/jpeg", "size": 2400000 }
+response: { "upload_url": "https://s3…/put?X-Amz-Signature=…", "key": "media/ab/cd/uuid" }
+```
+The client uploads the (client-encrypted) bytes directly to S3 via `upload_url`, then puts only `{key}` in the message's `media_ref` (§12).
+
+**⑤ Chat Server → Presence Service.** On heartbeat/connect/disconnect:
+```json
+{ "user_id": "alice", "status": "online", "last_seen_ts": 1730000000200 }
+```
+Presence writes this to Redis with a TTL; "last seen" is read on demand (§9).
+
+**⑥ The pub/sub backplane message (§5.1).** When routing A→B via the backplane, the envelope published to `gateway:B` (or `user:bob`) is just the delivery envelope from ② plus a target:
+```json
+{ "target_user": "bob", "envelope": { …the DELIVER payload… } }
+```
+
+### Part C — DB schema for each store
+
+Each store is matched to its data's shape and access pattern.
+
+**① Messages — Cassandra (the durable source of truth).** Partition by conversation, cluster by seq so "last N messages in chat X" is one partition scan:
+```
+TABLE messages (
+  conversation_id   text,          -- PARTITION KEY (co-locates a chat's messages)
+  seq               bigint,        -- CLUSTERING KEY (per-conversation order)
+  message_id        text,          -- global Snowflake id
+  sender_id         text,
+  content_type      text,
+  ciphertext        blob,          -- E2E-encrypted body (never plaintext)
+  media_key         text,          -- S3 key if media, else null
+  server_ts         timestamp,
+  PRIMARY KEY ( conversation_id, seq )
+) WITH CLUSTERING ORDER BY ( seq DESC );   -- newest first
+```
+Partition = `conversation_id`, clustering = `seq` (verified ordering). This is the wide-column trick: dominant query "last 50 in chat X" = single-partition, disk-local scan.
+
+**② Conversations — relational or Cassandra (chat metadata).** One row per chat + a per-user index of their chats:
+```
+TABLE conversations (
+  conversation_id   text PRIMARY KEY,
+  type              text,          -- 'direct' | 'group'
+  member_ids        set<text>,     -- participants (small for direct, ≤256 for group)
+  last_message_seq  bigint,        -- for "unread since"
+  last_activity_ts  timestamp,
+  created_at        timestamp
+)
+TABLE user_conversations (         -- "which chats does a user have?"
+  user_id           text,          -- PARTITION KEY
+  last_activity_ts  timestamp,     -- CLUSTERING (sort chat list by recency)
+  conversation_id   text,
+  PRIMARY KEY ( user_id, last_activity_ts )
+)
+```
+
+**③ Connection Registry — Redis (who's connected where, §4.3/§5.1).** Ephemeral, global, TTL-refreshed by heartbeat:
+```
+KEY   conn:{user_id}        VALUE  gateway_node_id      TTL ~30s (refreshed by heartbeat)
+  e.g. conn:bob → "gw-12"
+```
+This answers "which gateway holds Bob" — it locates, it does not transport (§5.1). Small (~10 GB for 200M users, §4.6).
+
+**④ Presence — Redis (last-seen, §9).** Just a timestamp per user; "last seen" is derived on read:
+```
+KEY   presence:{user_id}    VALUE  last_heartbeat_ts    TTL (online if key fresh)
+  e.g. presence:alice → 1730000000200
+```
+Online = key exists & fresh; otherwise "last seen {value}". Kept approximate to avoid fan-out storms.
+
+**⑤ Message status / receipts (§8).** Written **async & batched** (high volume, ~1M/sec, off the critical path):
+```
+TABLE message_status (
+  conversation_id   text,          -- PARTITION KEY
+  seq               bigint,        -- CLUSTERING
+  delivered_ts      timestamp,     -- null until delivered
+  read_ts           timestamp,     -- null until read
+  PRIMARY KEY ( conversation_id, seq )
+)
+```
+Status can also be folded into the messages row; a separate table keeps the hot write path clean.
+
+**⑥ Groups & membership.** Membership drives group fan-out (§10):
+```
+TABLE groups (
+  group_id     text PRIMARY KEY,
+  name         text,
+  admin_ids    set<text>,
+  created_at   timestamp
+)
+TABLE group_members (
+  group_id     text,               -- PARTITION KEY
+  user_id      text,               -- CLUSTERING
+  role         text,               -- 'admin' | 'member'
+  joined_at    timestamp,
+  PRIMARY KEY ( group_id, user_id )
+)
+```
+On a group send, look up `group_members` for the recipient list, then fan out (hybrid push/pull, §10).
+
+**⑦ Media metadata — relational/Cassandra (bytes live in S3, §12).** Only a reference is stored:
+```
+TABLE media (
+  media_key    text PRIMARY KEY,   -- the S3 key
+  uploader_id  text,
+  content_type text,
+  size_bytes   bigint,
+  created_at   timestamp
+)
+```
+
+**⑧ Idempotency / dedup — Redis (short-lived).** Prevents double-store of retried sends:
+```
+KEY   dedup:{client_msg_id}   VALUE  message_id   TTL ~hours
+  → if present on a resend, the server returns the existing message_id instead of re-inserting
+```
+
+> 💡 **The three-layer contract, in one line:** *"The client request carries a `client_msg_id` (idempotency), a deterministic `conversation_id`, and an E2E `ciphertext`; the server enriches it with a global `message_id`, a per-conversation `seq`, and a `server_ts` before persisting to Cassandra (partitioned by conversation, clustered by seq) and delivering a minimal envelope to the recipient's gateway — while the offline push deliberately carries no content, presence/registry live in TTL'd Redis, and media is just an S3 key. Every field exists for a reason: idempotency, ordering, or E2E."* Being able to name each field's purpose is exactly the depth a senior interview probes.
+
 ## 8. Read Receipts & Delivery States
 
 A message moves through a small **state machine**: **sent** (left sender) → **delivered** (reached recipient's device) → **read** (recipient opened the chat). These are the familiar one/two/blue checkmarks.
@@ -503,5 +708,10 @@ The registry only returns an *address*, not a transport — it doesn't move the 
 - **Wide-column store** — Cassandra-style DB, partitioned by a key, sorted within the partition.
 
 ---
+- **client_msg_id** — a client-generated id on each send, used as the idempotency/dedup key so retries store the message only once.
+- **conversation_id** — the chat's partition key; for 1:1 chats it's a deterministic function of the sorted user pair so both directions map to the same partition.
+- **seq (sequence number)** — a per-conversation monotonic counter giving in-chat ordering; the Cassandra clustering key.
+- **message_id** — the server-assigned global (Snowflake) id for a message, distinct from client_msg_id.
+- **delivery envelope** — the enriched payload (message_id + seq + server_ts added) the chat server routes to the recipient's gateway.
 
 *Reference document. Contributions and corrections welcome.*
